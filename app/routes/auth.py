@@ -30,6 +30,7 @@ from app.services.auth_service import (
     create_authorized_app,
     create_password_reset,
     create_user_with_role,
+    get_password_reset_sender_email,
     get_user_by_email,
     get_user_by_id,
     get_valid_password_reset_user_id,
@@ -98,6 +99,8 @@ def auth_signup():
     tags:
       - Auth
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -114,6 +117,8 @@ def auth_signup():
     responses:
       201:
         description: User created
+      400:
+        description: Missing required headers or invalid request payload
       409:
         description: Email exists
     """
@@ -133,7 +138,7 @@ def auth_signup():
     )
 
     try:
-        send_signup_email(data.email)
+        send_signup_email(data.email, app_name=app_name)
     except Exception:
         current_app.logger.exception("Failed to send signup email")
 
@@ -148,6 +153,8 @@ def auth_login():
     tags:
       - Auth
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -173,6 +180,8 @@ def auth_login():
               type: boolean
       401:
         description: Invalid credentials
+      400:
+        description: Missing required headers or invalid request payload
     """
     data = AuthRequest(**_payload_with_app_name())
     user = get_user_by_email(data.email)
@@ -204,6 +213,8 @@ def auth_set_mpin():
     tags:
       - Auth
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -216,6 +227,8 @@ def auth_set_mpin():
     responses:
       200:
         description: MPIN saved successfully
+      400:
+        description: Missing required headers or invalid request payload
       401:
         description: Invalid token subject or unauthorized
       404:
@@ -243,20 +256,27 @@ def auth_create_app():
     tags:
       - Admin
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
         schema:
           type: object
-          required: [app_name]
+          required: [app_name, password_reset_email]
           properties:
             app_name:
               type: string
             client_secret:
               type: string
+            password_reset_email:
+              type: string
+              format: email
     responses:
       201:
         description: App created
+      400:
+        description: Missing required headers or invalid request payload
       403:
         description: Super user required
       409:
@@ -270,16 +290,27 @@ def auth_create_app():
     if not actor or not actor.get("super_user"):
         return jsonify({"error": "Super user access required"}), 403
 
-    data = CreateAppRequest(**_payload_with_app_name())
+    payload = request.get_json(silent=True) or {}
+    data = CreateAppRequest(**payload)
     client_secret = data.client_secret or secrets.token_urlsafe(24)
 
     try:
-        create_authorized_app(data.app_name, generate_password_hash(client_secret))
+        create_authorized_app(data.app_name, generate_password_hash(client_secret), data.password_reset_email)
     except IntegrityError:
         return jsonify({"error": "App already exists"}), 409
 
     log_audit(actor_id, g.app_name, "create-app", True, {"created_app": data.app_name})
-    return jsonify({"message": "App created", "app_name": data.app_name, "client_secret": client_secret}), 201
+    return (
+        jsonify(
+        {
+          "message": "App created",
+          "app_name": data.app_name,
+          "client_secret": client_secret,
+          "password_reset_email": data.password_reset_email,
+        }
+        ),
+        201,
+    )
 
 
 @auth_bp.route("/make-super-user", methods=["POST"])
@@ -290,6 +321,8 @@ def auth_make_super_user():
     tags:
       - Admin
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -304,6 +337,8 @@ def auth_make_super_user():
     responses:
       200:
         description: Role updated
+      400:
+        description: Missing required headers or invalid request payload
       403:
         description: Super user required
       404:
@@ -334,9 +369,14 @@ def auth_refresh():
     ---
     tags:
       - Auth
+    parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
     responses:
       200:
         description: Tokens refreshed successfully
+      400:
+        description: Missing required headers or invalid request payload
       401:
         description: Invalid token subject
       403:
@@ -376,6 +416,8 @@ def auth_forgot():
     tags:
       - Auth
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -388,6 +430,8 @@ def auth_forgot():
     responses:
       200:
         description: Reset email sent (if email exists)
+      400:
+        description: Missing required headers or invalid request payload
     """
     data = PasswordResetRequest(**_payload_with_app_name())
     user = get_user_by_email(data.email)
@@ -400,7 +444,8 @@ def auth_forgot():
     create_password_reset(str(user["id"]), token, expires_at)
 
     reset_url = f"{current_app.config['PASSWORD_RESET_BASE_URL']}?token={token}&app={g.app_name}"
-    send_password_reset_email(data.email, reset_url)
+    sender_email = get_password_reset_sender_email(g.app_name)
+    send_password_reset_email(data.email, reset_url, app_name=g.app_name, sender_email=sender_email)
 
     log_audit(str(user["id"]), g.app_name, "forgot-password", True)
     return jsonify({"message": "Reset email sent"})
@@ -413,6 +458,8 @@ def auth_reset():
     tags:
       - Auth
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -428,7 +475,7 @@ def auth_reset():
       200:
         description: Password reset successful
       400:
-        description: Invalid or expired token
+        description: Missing required headers, invalid request payload, or invalid/expired token
     """
     data = ResetPasswordRequest(**_payload_with_app_name())
 
@@ -443,7 +490,7 @@ def auth_reset():
     user = get_user_by_id(user_id)
     if user and user.get("email"):
         try:
-            send_password_changed_email(str(user["email"]))
+            send_password_changed_email(str(user["email"]), app_name=g.app_name)
         except Exception:
             current_app.logger.exception("Failed to send password changed email")
 
@@ -459,6 +506,8 @@ def auth_mpin_verify():
     tags:
       - Auth
     parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
       - in: body
         name: body
         required: true
@@ -471,6 +520,8 @@ def auth_mpin_verify():
     responses:
       200:
         description: MPIN verified, fresh token issued
+      400:
+        description: Missing required headers or invalid request payload
       401:
         description: Invalid token subject or invalid MPIN
     """
@@ -500,9 +551,14 @@ def auth_logout():
     ---
     tags:
       - Auth
+    parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
     responses:
       200:
         description: Logged out successfully
+      400:
+        description: Missing required headers or invalid request payload
       401:
         description: Invalid token subject
     """
@@ -524,6 +580,9 @@ def auth_profile():
     ---
     tags:
       - Auth
+    parameters:
+      - $ref: '#/parameters/AppNameHeader'
+      - $ref: '#/parameters/ClientSecretHeader'
     responses:
       200:
         description: User profile retrieved
@@ -545,6 +604,8 @@ def auth_profile():
         description: Invalid token subject
       404:
         description: User not found
+      400:
+        description: Missing required headers or invalid request payload
     """
     user_id = _get_identity_user_id()
     if not user_id:
