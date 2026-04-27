@@ -29,6 +29,22 @@ def create_app() -> Flask:
             },
             "basePath": "/",
             "schemes": ["http", "https"],
+            "parameters": {
+                "AppNameHeader": {
+                    "name": "X-App-Name",
+                    "in": "header",
+                    "required": True,
+                    "type": "string",
+                    "description": "Authorized client application name.",
+                },
+                "ClientSecretHeader": {
+                    "name": "X-Client-Secret",
+                    "in": "header",
+                    "required": True,
+                    "type": "string",
+                    "description": "Shared secret for the authorized client application.",
+                },
+            },
         },
     )
 
